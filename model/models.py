@@ -10,6 +10,10 @@ import torch.nn.functional as F
 
 
 from pyro.distributions import MultivariateNormal, Normal, Independent
+from torch.distributions import kl_divergence
+
+from .encoders import ReliabilityHead
+from .decoder import scale_noise_by_reliability
 
 from sklearn.cluster import KMeans, SpectralClustering
 from sklearn.metrics import adjusted_rand_score
@@ -19,24 +23,33 @@ from scipy.sparse import csgraph
 from scipy.sparse.linalg import eigsh
 
 import sys
-sys.path.append('/home/REDACTED/chf-github/model/')
-from utils import check_has_missing, quad_function, convert_XY_pack_pad
-
 sys.path.append('../evaluation/')
-from eval_utils import get_cluster_swap_metric, get_cluster_pear_metric
+try:
+    from eval_utils import get_cluster_swap_metric, get_cluster_pear_metric
+except Exception:  # pragma: no cover - optional dependency
+    get_cluster_swap_metric = lambda *args, **kwargs: None
+    get_cluster_pear_metric = lambda *args, **kwargs: None
 
 sys.path.append('../plot/')
-from plot_utils import plot_latent_labels, plot_delta_comp
+try:
+    from plot_utils import plot_latent_labels, plot_delta_comp
+except Exception:  # pragma: no cover - optional dependency
+    plot_latent_labels = plot_delta_comp = None
+
+from .utils import check_has_missing, quad_function, convert_XY_pack_pad
 
 
-import matplotlib.pylab as pylab
-params = {'legend.fontsize': 'x-large',
-# 'figure.figsize': (10,6),
- 'axes.labelsize': 'x-large',
- 'axes.titlesize':'x-large',
- 'xtick.labelsize':'x-large',
- 'ytick.labelsize':'x-large'}
-pylab.rcParams.update(params)
+try:
+    import matplotlib.pylab as pylab
+    params = {'legend.fontsize': 'x-large',
+    # 'figure.figsize': (10,6),
+     'axes.labelsize': 'x-large',
+     'axes.titlesize':'x-large',
+     'xtick.labelsize':'x-large',
+     'ytick.labelsize':'x-large'}
+    pylab.rcParams.update(params)
+except Exception:  # pragma: no cover
+    pass
 
 class Model(nn.Module):
     def __init__(self):
@@ -375,10 +388,12 @@ class TwoLayer(nn.Module):
         return x
     
 class Sublign(Model):
-    def __init__(self, dim_stochastic, dim_hidden, dim_rnn, C=0.0, dim_biomarkers=3, 
+    def __init__(self, dim_stochastic, dim_hidden, dim_rnn, C=0.0, dim_biomarkers=3,
                  reg_type = 'l2', sigmoid=True, learn_time=True, auto_delta=True, max_delta=10.,
                 plot_debug=False, epoch_debug=False, beta=0.001, device='cpu',
-                how_missing='linear'):
+                how_missing='linear', use_reliability=True,
+                reliability_prior_mu=0., reliability_prior_sigma=1.,
+                g_function='softplus', lambda_max=1.0):
         """
         note no lr here. lr is in fit.
         """
@@ -391,6 +406,11 @@ class Sublign(Model):
         self.reg_type       = reg_type
         
         self.sigmoid        = sigmoid
+        self.use_reliability = use_reliability
+        self.r_prior_mu = reliability_prior_mu
+        self.r_prior_sigma = reliability_prior_sigma
+        self.g_function = g_function
+        self.lambda_max = lambda_max
         
         self.dz_features    = self.dim_stochastic
         rnn_input_size      = self.n_biomarkers + 1
@@ -399,6 +419,8 @@ class Sublign(Model):
         self.rnn       = nn.RNN(rnn_input_size, self.dim_rnn, 1, batch_first = True)
         self.enc_h_mu  = nn.Linear(self.dim_rnn, self.dim_stochastic)
         self.enc_h_sig = nn.Linear(self.dim_rnn, self.dim_stochastic)
+        if self.use_reliability:
+            self.rel_head = ReliabilityHead(self.dim_rnn)
         
         self.how_missing = how_missing
 
@@ -587,22 +609,30 @@ class Sublign(Model):
             Y = torch.tensor(Y).to(self.device)
             M = torch.tensor(M).to(self.device)
             
-        z, kl        = self.sample(X,Y,XY=XY,
+        z, kl, r, kl_r = self.sample(X,Y,XY=XY,
                                    all_seq_lengths=all_seq_lengths, has_missing=has_missing)
         theta        = self.infer_functional_params(z)
         with torch.no_grad():
-            best_delta   = self.get_best_delta(X,Y,M,theta, kl)
+            best_delta   = self.get_best_delta(X,Y,M,theta, kl + kl_r)
         yhat        = self.predict_Y(X,Y,theta,best_delta)
         self.debug['y_out'] = yhat
         squared     = (Y - yhat)**2
-        
+
+        # scale noise using reliability
+        if self.use_reliability:
+            sigma2 = scale_noise_by_reliability(r, g=self.g_function)
+        else:
+            sigma2 = torch.ones_like(r)
+        self.debug['r'] = r
+        self.debug['kl_r'] = kl_r
+        sigma2_expand = sigma2[:, None, None]
+        nll = 0.5 * ((squared / sigma2_expand) + torch.log(sigma2_expand))
+
         # mask out originally missing values
-        squared     = squared.masked_fill(M == 0., 0)
-        nll         = squared.sum(-1).sum(-1)
-        delta_term  = torch.log(torch.ones_like(nll) / self.N_delta_bins)    
-#         nelbo       = nll + self.beta*anneal*kl + delta_term
-        nelbo       = nll + self.beta*anneal*kl
-        return nelbo, nll, kl
+        nll = nll.masked_fill(M == 0., 0)
+        nll = nll.sum(-1).sum(-1)
+        nelbo       = nll + self.beta*anneal*(kl + kl_r)
+        return nelbo, nll, kl + kl_r
     
     def forward(self, Y, S, X, M, T, anneal = 1., 
                 XY=None,all_seq_lengths=None, has_missing=False):
@@ -672,16 +702,26 @@ class Sublign(Model):
         z      = torch.squeeze(q_dist.rsample((1,)))
         p_dist = Independent(Normal(torch.zeros_like(mu), torch.ones_like(sig)), 1)
         kl     = q_dist.log_prob(z)-p_dist.log_prob(z)
-        
+
+        if self.use_reliability:
+            r, mu_r, log_sig_r = self.rel_head(hid)
+            q_r = Normal(mu_r, torch.exp(log_sig_r))
+            p_r = Normal(torch.ones_like(mu_r)*self.r_prior_mu,
+                         torch.ones_like(mu_r)*self.r_prior_sigma)
+            kl_r = kl_divergence(q_r, p_r).squeeze(-1)
+        else:
+            r = torch.ones(mu.shape[0], 1).to(self.device)
+            kl_r = torch.zeros(mu.shape[0]).to(self.device)
+
         self.debug['hid'] = hid
         self.debug['kl'] = kl
         self.debug['mu'] = mu
         self.debug['sig'] = sig
-        
+
         if mu_std:
             return z, kl, mu
         else:
-            return z, kl
+            return z, kl, r, kl_r
     
     def get_mu(self, X,Y):
         N = X.shape[0]

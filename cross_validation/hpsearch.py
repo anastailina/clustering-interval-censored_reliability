@@ -123,6 +123,11 @@ def get_unsup_results(train_loader, train_data_dict, valid_loader, test_data_dic
                                         hp['dim_rnn']        = dim_rnn
                                         hp['reg_type']       = reg_type
                                         hp['sigmoid']        = sigmoid
+                                        hp['use_reliability'] = True
+                                        hp['g_function']      = args.g_function
+                                        hp['reliability_prior_mu'] = args.reliability_prior_mu
+                                        hp['reliability_prior_sigma'] = args.reliability_prior_sigma
+                                        hp['lambda_max']     = args.lambda_max
 #                                         hp['eval_freq']      = 10
                                         hp['dim_biomarkers'] = 3 if sigmoid else 1
                                         if ppmi:
@@ -206,6 +211,14 @@ if __name__=='__main__':
     parser.add_argument('--nelbo', action='store_true', help="Hyperparam search based on NELBO")
     parser.add_argument('--nll', action='store_true', help="Hyperparam search based on NLL")
     parser.add_argument('--cheat', action='store_true', help="Hyperparam search based on cheating")
+    parser.add_argument('--reliability-prior-mu', dest='reliability_prior_mu', type=float, default=0.0,
+                        help='Mean of logit-normal prior for reliability')
+    parser.add_argument('--reliability-prior-sigma', dest='reliability_prior_sigma', type=float, default=1.0,
+                        help='Std of logit-normal prior for reliability')
+    parser.add_argument('--g-function', dest='g_function', type=str, default='softplus',
+                        choices=['softplus', 'exp'], help='Noise scaling function')
+    parser.add_argument('--lambda-max', dest='lambda_max', type=float, default=1.0,
+                        help='Poisson rate for error counts')
     
     args = parser.parse_args()
         

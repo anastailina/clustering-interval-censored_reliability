@@ -4,7 +4,25 @@ This repo contains experiments for "[Clustering Interval-Censored Data for Disea
 
 Code is released for the purposes of transparency and replication. It has not been extensively cleaned --- nor was it designed to be run directly from this repo. Certain terms have been redacted for security concerns. If there are any questions, please contact Irene Chen at iychen@csail.mit.edu.
 
-Code is written for Python 3.7. 
+Code is written for Python 3.7.
+
+## Reliability Latent Variable
+
+The implementation now includes an optional reliability latent variable
+\(r_i \in (0,1)\) for every patient.  When enabled with the
+``--use-reliability`` flag (on by default), the model learns to inflate the
+observation noise for trajectories that are deemed unreliable.  The
+behaviour of this component can be controlled with the following new
+hyper-parameters:
+
+* ``--reliability-prior-mu`` and ``--reliability-prior-sigma`` specify the
+  logit-normal prior on ``r``.
+* ``--g-function`` chooses the monotone function used to scale the
+  observation variance (``softplus`` or ``exp``).
+* ``--lambda-max`` sets the Poisson rate when error counts are provided.
+
+The mean of the inferred reliability variable can be monitored during
+training to diagnose noisy patients.
 
 ## Main Paper
 
